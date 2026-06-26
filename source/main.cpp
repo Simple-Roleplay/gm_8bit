@@ -49,6 +49,8 @@ EightbitState* g_eightbit = nullptr;
 typedef void (*SV_BroadcastVoiceData)(IClient* cl, int nBytes, char* data, int64 xuid);
 Detouring::Hook detour_BroadcastVoiceData;
 
+static char pcmSendBuffer[sizeof(uint64_t) + 20 * 1024];
+
 void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 	//Check if the player is in the set of enabled players.
 	//This is (and needs to be) and O(1) operation for how often this function is called.
@@ -61,16 +63,16 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 	}
 #endif
 
-	auto& afflicted_players = g_eightbit->afflictedPlayers;
-	if (g_eightbit->broadcastPackets && nBytes > sizeof(uint64_t)) {
-		//Get the user's steamid64, put it at the beginning of the buffer.
-		//Notice that we don't use the conveniently provided one in the voice packet. The client can manipulate that one.
-
 #if defined ARCHITECTURE_X86
 		uint64_t id64 = *(uint64_t*)((char*)cl + 181);
 #else
 		uint64_t id64 = *(uint64_t*)((char*)cl + 189);
 #endif
+
+	auto& afflicted_players = g_eightbit->afflictedPlayers;
+	if (g_eightbit->broadcastPackets && nBytes > sizeof(uint64_t)) {
+		//Get the user's steamid64, put it at the beginning of the buffer.
+		//Notice that we don't use the conveniently provided one in the voice packet. The client can manipulate that one.
 
 		*(uint64_t*)decompressedBuffer = id64;
 
@@ -81,6 +83,22 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 
 		//Finally we'll broadcast our new packet
  		net_handl->SendPacket(g_eightbit->ip.c_str(), g_eightbit->port, decompressedBuffer, nBytes);
+	}
+
+	if (g_eightbit->broadcastRawPcm && nBytes > STEAM_PCKT_SZ) {
+		auto& codecs = g_eightbit->broadcastCodecs;
+		if (codecs.find(uid) == codecs.end()) {
+			IVoiceCodec* codec = new SteamOpus::Opus_FrameDecoder();
+			codec->Init(5, 24000);
+			codecs[uid] = codec;
+		}
+		IVoiceCodec* codec = codecs[uid];
+		char * pcmPayload = pcmSendBuffer + sizeof(uint64_t);
+		int decompressed = SteamVoice::DecompressIntoBuffer(codec, data, nBytes, pcmPayload, sizeof(pcmSendBuffer) - sizeof(uint64_t));
+		if (decompressed > 0) {
+			*(uint64_t*)pcmSendBuffer = id64;
+			net_handl->SendPacket(g_eightbit->ip.c_str(), g_eightbit->pcmPort, pcmSendBuffer, sizeof(uint64_t) + decompressed);
+		}
 	}
 
 	if (afflicted_players.find(uid) != afflicted_players.end()) {
@@ -131,6 +149,17 @@ void hook_BroadcastVoiceData(IClient* cl, uint nBytes, char* data, int64 xuid) {
 	else {
 		return detour_BroadcastVoiceData.GetTrampoline<SV_BroadcastVoiceData>()(cl, nBytes, data, xuid);
 	}
+}
+
+LUA_FUNCTION_STATIC(eightbit_broadcastRaw) {
+	g_eightbit->broadcastRawPcm = LUA->GetBool(1);
+	return 0;
+}
+
+
+LUA_FUNCTION_STATIC(eightbit_setpcmport) {
+	g_eightbit->pcmPort = (uint16_t)LUA->GetNumber(1);
+	return 0;
 }
 
 LUA_FUNCTION_STATIC(eightbit_crush) {
@@ -253,6 +282,16 @@ GMOD_MODULE_OPEN()
 		LUA->PushCFunction(eightbit_setbroadcastport);
 		LUA->SetTable(-3);
 
+
+		LUA->PushString("EnableBroadcastRaw");
+		LUA->PushCFunction(eightbit_broadcastRaw);
+		LUA->SetTable(-3);
+
+
+		LUA->PushString("SetPCMPort");
+		LUA->PushCFunction(eightbit_setpcmport);
+		LUA->SetTable(-3);
+
 		LUA->PushString("EFF_NONE");
 		LUA->PushNumber(AudioEffects::EFF_NONE);
 		LUA->SetTable(-3);
@@ -286,6 +325,11 @@ GMOD_MODULE_CLOSE()
 		if (codec != nullptr) {
 			delete codec;
 		}
+	}
+
+	for (auto& p : g_eightbit->broadcastCodecs) {
+		if (p.second != nullptr)
+			delete p.second;
 	}
 
 	delete net_handl;
